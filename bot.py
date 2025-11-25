@@ -5,651 +5,461 @@ import asyncio
 import csv
 import io
 from datetime import datetime
-from typing import Set, Dict, List, Optional
-from collections import defaultdict
+from typing import Dict, List, Optional
 
 import requests
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiosqlite
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Проверка обязательных переменных окружения
+# Проверка токена
 if "BOT_TOKEN" not in os.environ:
-    raise RuntimeError("Не задано BOT_TOKEN. Додай змінну оточення BOT_TOKEN на хостингу з токеном свого Telegram-бота.")
+    raise RuntimeError("Не задано BOT_TOKEN")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = os.environ.get("ADMIN_ID")
-
-# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+dp = Dispatcher(bot)
 
-# In-memory состояния
-WAITING_API_KEY: Set[int] = set()
-WAITING_DOMAINS_ONETIME: Set[int] = set()
+# Глобальные переменные для состояний
+user_states = {}
+user_last_report = {}
 
 # Константы
 PROBLEM_CATEGORIES = {"malicious", "malware", "phishing", "suspicious"}
 CATEGORY_TRANSLATIONS = {
-    "phishing": "фішинговий (крадіжка даних/логінів/карток)",
-    "malware": "шкідливий (malware)", 
+    "phishing": "фішинговий",
+    "malware": "шкідливий", 
     "malicious": "шкідливий",
     "suspicious": "підозрілий"
 }
 
 # Инициализация БД
 async def init_db():
-    async with aiosqlite.connect("vt_domains_bot.db") as db:
-        # Таблица пользователей
+    async with aiosqlite.connect("vt_bot.db") as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                vt_api_key TEXT
+                api_key TEXT
             )
         ''')
-        
-        # Таблицы для ежедневных списков (фаза 2)
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS domain_lists (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                daily_enabled INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        ''')
-        
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS domain_list_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                list_id INTEGER NOT NULL,
-                domain TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (list_id) REFERENCES domain_lists(id)
-            )
-        ''')
-        
         await db.commit()
 
+# Клавиатуры
+def main_menu():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.row(InlineKeyboardButton("✅ Перевірити домени", callback_data="check_domains"))
+    keyboard.row(InlineKeyboardButton("🔐 Мій API ключ", callback_data="set_key"))
+    keyboard.row(InlineKeyboardButton("ℹ️ Допомога", callback_data="help"))
+    return keyboard
+
+def back_button():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="main_menu"))
+    return keyboard
+
 # Вспомогательные функции
-def is_valid_vt_key(text: str) -> bool:
-    """Проверяет, похож ли текст на VT API ключ"""
+def is_valid_key(text):
     return bool(re.match(r'^[0-9a-fA-F]{64}$', text.strip()))
 
-def normalize_domain(domain: str) -> Optional[str]:
-    """Нормализует домен, возвращает None если не валидный"""
-    domain = domain.strip().lower()
-    
-    # Удаляем протокол
-    if domain.startswith(('http://', 'https://')):
-        domain = domain.split('://', 1)[1]
-    
-    # Удаляем путь и параметры
-    domain = domain.split('/')[0]
-    
-    # Удаляем порт
-    domain = domain.split(':')[0]
-    
-    # Удаляем www
-    if domain.startswith('www.'):
-        domain = domain[4:]
-    
-    # Проверяем что это домен (содержит точку и не пустой)
-    if '.' not in domain or not domain:
-        return None
-    
-    return domain
-
-def parse_domains(text: str) -> List[str]:
-    """Парсит домены из текста"""
-    # Разделяем по пробелам, запятым, новым строкам
-    parts = re.split(r'[,\s]+', text.strip())
-    
+def parse_domains(text):
+    parts = re.split(r'[,\s\n]+', text.strip())
     domains = set()
     for part in parts:
+        part = part.strip().lower()
         if not part:
             continue
             
-        domain = normalize_domain(part)
-        if domain:
-            domains.add(domain)
-    
+        # Удаляем протокол и путь
+        if part.startswith(('http://', 'https://')):
+            part = part.split('://', 1)[1]
+        part = part.split('/')[0]
+        part = part.split(':')[0]
+        
+        if part.startswith('www.'):
+            part = part[4:]
+            
+        if '.' in part and part:
+            domains.add(part)
+            
     return list(domains)
 
-def translate_category(category: str) -> str:
-    """Переводит категорию на украинский"""
-    return CATEGORY_TRANSLATIONS.get(category, category)
-
-def calculate_risk_level(problems: List[Dict]) -> tuple:
-    """Рассчитывает уровень риска и возвращает (уровень, текст)"""
+def get_risk_level(problems):
     if not problems:
-        return "green", "🟢 Низький ризик"
+        return "🟢 Низький ризик", "green"
     
-    # Считаем проблемные категории
-    problem_cats = [p["category"] for p in problems]
-    high_risk_cats = [cat for cat in problem_cats if cat in ["phishing", "malware", "malicious"]]
+    categories = [p["category"] for p in problems]
+    high_risk = any(cat in ["phishing", "malware", "malicious"] for cat in categories)
     
-    if not high_risk_cats and problem_cats.count("suspicious") <= 2:
-        return "yellow", "🟡 Середній ризик"
+    if not high_risk and categories.count("suspicious") <= 2:
+        return "🟡 Середній ризик", "yellow"
     
-    if high_risk_cats or len(problems) >= 3:
-        return "red", "🔴 Високий ризик"
-    
-    return "yellow", "🟡 Середній ризик"
-
-def chunk_text(text: str, limit: int = 3800) -> List[str]:
-    """Разбивает текст на части по лимиту символов"""
-    if len(text) <= limit:
-        return [text]
-    
-    chunks = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        
-        # Ищем последний перенос строки перед лимитом
-        split_pos = text.rfind('\n', 0, limit)
-        if split_pos == -1:
-            split_pos = limit
-        
-        chunks.append(text[:split_pos])
-        text = text[split_pos:].lstrip()
-    
-    return chunks
+    return "🔴 Високий ризик", "red"
 
 # VirusTotal API
-async def check_domain_vt(domain: str, api_key: str) -> Dict:
-    """Проверяет домен через VirusTotal API"""
+async def check_domain(domain, api_key):
     url = f"https://www.virustotal.com/api/v3/domains/{domain}"
     headers = {"x-apikey": api_key}
     
     try:
         response = requests.get(url, headers=headers, timeout=30)
         
-        if response.status_code == 404:
-            return {"error": "http_404"}
-        elif response.status_code == 401:
-            return {"error": "http_401_unauthorized"}
+        if response.status_code == 401:
+            return {"error": "Невірний API ключ"}
+        elif response.status_code == 404:
+            return {"error": "Домен не знайдено"}
         elif response.status_code == 429:
-            return {"error": "http_429_rate_limit"}
-        elif response.status_code >= 500:
-            return {"error": f"http_{response.status_code}_server_error"}
+            return {"error": "Перевищено ліміт запитів"}
         elif response.status_code != 200:
-            return {"error": f"http_{response.status_code}"}
-        
-        response.raise_for_status()
-        
+            return {"error": f"Помилка API: {response.status_code}"}
+            
         data = response.json()
-        
-        # Извлекаем результаты анализа
-        last_analysis = data.get("data", {}).get("attributes", {}).get("last_analysis_results", {})
+        results = data.get("data", {}).get("attributes", {}).get("last_analysis_results", {})
         
         problems = []
-        for engine_name, engine_data in last_analysis.items():
-            category = engine_data.get("category")
+        for engine, result in results.items():
+            category = result.get("category")
             if category in PROBLEM_CATEGORIES:
                 problems.append({
-                    "engine_name": engine_name,
+                    "engine_name": engine,
                     "category": category
                 })
-        
+                
         return {"problems": problems}
         
-    except requests.exceptions.RequestException as e:
-        logger.error(f"HTTP error for domain {domain}: {e}")
-        return {"error": f"http_error: {type(e).__name__}"}
-    except ValueError as e:
-        logger.error(f"JSON parse error for domain {domain}: {e}")
-        return {"error": "json_parse_error"}
     except Exception as e:
-        logger.error(f"Unexpected error for domain {domain}: {e}")
-        return {"error": f"unexpected: {type(e).__name__}"}
-
-# Клавиатуры
-def get_main_keyboard() -> InlineKeyboardMarkup:
-    """Возвращает главное меню"""
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("✅ Разова перевірка доменів", callback_data="one_time_check"),
-        InlineKeyboardButton("📅 Щоденна перевірка списків (скоро)", callback_data="daily_coming_soon"),
-        InlineKeyboardButton("🔐 Мій API-ключ", callback_data="set_api_key"),
-        InlineKeyboardButton("ℹ️ Допомога та ліміти", callback_data="help_limits")
-    )
-    return keyboard
-
-def get_back_to_menu_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура с кнопкой назад в меню"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🔙 Назад до меню", callback_data="back_to_menu"))
-    return keyboard
-
-def get_report_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для экспорта отчета"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("📎 Отримати звіт файлом", callback_data="export_report"))
-    keyboard.add(InlineKeyboardButton("🔙 Назад до меню", callback_data="back_to_menu"))
-    return keyboard
+        return {"error": f"Помилка мережі: {str(e)}"}
 
 # Обработчики команд
 @dp.message_handler(commands=['start', 'menu'])
 async def cmd_start(message: types.Message):
-    """Обработчик команд /start и /menu"""
     user_id = message.from_user.id
     
-    # Проверяем есть ли API ключ пользователя
-    async with aiosqlite.connect("vt_domains_bot.db") as db:
-        cursor = await db.execute("SELECT vt_api_key FROM users WHERE user_id = ?", (user_id,))
-        user_data = await cursor.fetchone()
+    # Проверяем наличие API ключа
+    async with aiosqlite.connect("vt_bot.db") as db:
+        cursor = await db.execute("SELECT api_key FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
     
-    has_api_key = user_data and user_data[0]
+    has_key = bool(row and row[0])
     
-    welcome_text = """ЙОВ! 👋
+    text = """ЙОВ! 👋
 
 Це бот для перевірки доменів через VirusTotal.
 
-1️⃣ Спочатку вкажи свій API-ключ VirusTotal.
-🔒 Ключ зберігається лише для тебе і використовується тільки для перевірок доменів.
-
 """
     
-    if has_api_key:
-        welcome_text += "✅ API-ключ уже збережений. Можеш одразу перевіряти домени.\n\n"
+    if has_key:
+        text += "✅ API ключ збережений\n\n"
     else:
-        welcome_text += "❗ Зараз API-ключ ще *не збережений*.\n\n"
+        text += "❌ API ключ не встановлений\n\n"
+        
+    text += "Оберіть дію:"
     
-    welcome_text += """Далі обери режим:
-✅ Разова перевірка доменів
-📅 Щоденна перевірка списків (щодня о 11:00 за Києвом).
-"""
-    
-    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    await message.answer(text, reply_markup=main_menu())
 
 @dp.message_handler(commands=['cancel'])
 async def cmd_cancel(message: types.Message):
-    """Обработчик команды /cancel"""
-    # Сбрасываем состояния
     user_id = message.from_user.id
-    WAITING_API_KEY.discard(user_id)
-    WAITING_DOMAINS_ONETIME.discard(user_id)
-    
-    await message.answer("✅ Поточну дію скасовано. Повертаюся до головного меню.", 
-                        reply_markup=get_main_keyboard())
+    user_states.pop(user_id, None)
+    await message.answer("Дію скасовано", reply_markup=main_menu())
 
-# Обработчики callback-ов
-@dp.callback_query_handler(text="back_to_menu")
-async def callback_back_to_menu(callback_query: types.CallbackQuery):
-    """Возврат в главное меню"""
-    user_id = callback_query.from_user.id
-    WAITING_API_KEY.discard(user_id)
-    WAITING_DOMAINS_ONETIME.discard(user_id)
+# Обработчики кнопок
+@dp.callback_query_handler(lambda c: c.data == "main_menu")
+async def main_menu_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_states.pop(user_id, None)
     
-    # Проверяем есть ли API ключ пользователя
-    async with aiosqlite.connect("vt_domains_bot.db") as db:
-        cursor = await db.execute("SELECT vt_api_key FROM users WHERE user_id = ?", (user_id,))
-        user_data = await cursor.fetchone()
+    async with aiosqlite.connect("vt_bot.db") as db:
+        cursor = await db.execute("SELECT api_key FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
     
-    has_api_key = user_data and user_data[0]
+    has_key = bool(row and row[0])
     
-    welcome_text = """Повертаюся до головного меню:
+    text = "Головне меню:\n"
+    text += "✅ API ключ збережений\n" if has_key else "❌ API ключ не встановлений\n"
+    
+    await callback.message.edit_text(text, reply_markup=main_menu())
+    await callback.answer()
 
-"""
+@dp.callback_query_handler(lambda c: c.data == "set_key")
+async def set_key_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_states[user_id] = "waiting_key"
     
-    if has_api_key:
-        welcome_text += "✅ API-ключ уже збережений. Можеш одразу перевіряти домени.\n\n"
-    else:
-        welcome_text += "❗ Зараз API-ключ ще *не збережений*.\n\n"
-    
-    welcome_text += "Обери режим роботи:"
-    
-    await callback_query.message.edit_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-    await callback_query.answer()
+    text = """🔐 Надішліть ваш VirusTotal API ключ
 
-@dp.callback_query_handler(text="set_api_key")
-async def callback_set_api_key(callback_query: types.CallbackQuery):
-    """Настройка API ключа"""
-    user_id = callback_query.from_user.id
-    WAITING_API_KEY.add(user_id)
+Ключ має 64 символи (hex-рядок)
+Приклад: 495ae894e66dcd4b..."""
     
-    text = """🔐 *Налаштування API-ключа VirusTotal*
+    await callback.message.edit_text(text, reply_markup=back_button())
+    await callback.answer()
 
-Надішли свій API-ключ *одним повідомленням*.
-Бот автоматично збереже його для твого акаунта.
-
-_Приклад_: `495ae894e66dcd4b...`"""
+@dp.callback_query_handler(lambda c: c.data == "check_domains")
+async def check_domains_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
     
-    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_to_menu_keyboard())
-    await callback_query.answer()
-
-@dp.callback_query_handler(text="one_time_check")
-async def callback_one_time_check(callback_query: types.CallbackQuery):
-    """Разовая проверка доменов"""
-    user_id = callback_query.from_user.id
+    # Проверяем API ключ
+    async with aiosqlite.connect("vt_bot.db") as db:
+        cursor = await db.execute("SELECT api_key FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
     
-    # Проверяем есть ли API ключ
-    async with aiosqlite.connect("vt_domains_bot.db") as db:
-        cursor = await db.execute("SELECT vt_api_key FROM users WHERE user_id = ?", (user_id,))
-        user_data = await cursor.fetchone()
-    
-    if not user_data or not user_data[0]:
-        text = """❗ Спочатку потрібно додати свій API-ключ VirusTotal.
-
-Натисни *«🔐 Мій API-ключ»* у меню нижче або просто надішли свій ключ
-одним повідомленням — я його розпізнаю і збережу."""
-        await callback_query.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    if not row or not row[0]:
+        text = "❌ Спочатку встановіть API ключ"
+        await callback.message.edit_text(text, reply_markup=back_button())
+        await callback.answer()
         return
     
-    WAITING_DOMAINS_ONETIME.add(user_id)
+    user_states[user_id] = "waiting_domains"
     
-    text = """✅ *Разова перевірка доменів*
+    text = """✅ Надішліть список доменів
 
-Надішли список доменів *одним повідомленням*.
-Допускається формат:
-- з `http/https` або без;
-- з `www` або без;  
-- через пробіл, кому або з нового рядка.
+Формат:
+- Через пробіл, кому або з нового рядка
+- З http/https або без
+- З www або без
 
-_Приклад:_
-`https://news.heart-is-here.org`
-`fitnesalasinia.com`
-`www.healthblog.life`"""
+Приклад:
+example.com
+https://site.com
+www.test.org"""
     
-    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_to_menu_keyboard())
-    await callback_query.answer()
+    await callback.message.edit_text(text, reply_markup=back_button())
+    await callback.answer()
 
-@dp.callback_query_handler(text="daily_coming_soon")
-async def callback_daily_coming_soon(callback_query: types.CallbackQuery):
-    """Заглушка для ежедневных проверок"""
-    await callback_query.answer("📅 Функція щоденної перевірки списків буде доступна найближчим часом!", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data == "help")
+async def help_callback(callback: types.CallbackQuery):
+    text = """ℹ️ Допомога
 
-@dp.callback_query_handler(text="help_limits")
-async def callback_help_limits(callback_query: types.CallbackQuery):
-    """Помощь и лимиты"""
-    text = """ℹ️ *Допомога та ліміти*
-
-Бот використовує API VirusTotal.
-Основні моменти:
-- На безкоштовному тарифі VT є ліміти запитів на хвилину/добу.
-- Якщо ти відправиш занадто багато доменів, VT може повернути помилку *429 (rate limit)*.
-- У разі помилки ліміту бот покаже відповідну позначку.
-
-Статуси детекторів загроз переводяться приблизно так:
-- *phishing* → фішинговий (крадіжка даних/логінів/карток)
-- *malware / malicious* → шкідливий сайт / код  
-- *suspicious* → підозрілий
-
-Орієнтовні рівні ризику:
-- 🟢 Низький ризик — детектів немає
-- 🟡 Середній ризик — кілька легких підозр (suspicious)
-- 🔴 Високий ризик — фішинг/малваре, багато детектів"""
+• API ключ отримуйте на virustotal.com
+• Безкоштовний тариф має обмеження
+• Статуси:
+  🟢 Безпечний
+  🟡 Підозрілий  
+  🔴 Небезпечний
+  
+• Детектори:
+  - phishing - фішинг
+  - malware - шкідливе ПЗ
+  - malicious - шкідливий
+  - suspicious - підозрілий"""
     
-    await callback_query.message.edit_text(text, reply_markup=get_back_to_menu_keyboard(), parse_mode="Markdown")
-    await callback_query.answer()
+    await callback.message.edit_text(text, reply_markup=back_button())
+    await callback.answer()
 
-@dp.callback_query_handler(text="export_report")
-async def callback_export_report(callback_query: types.CallbackQuery):
-    """Экспорт отчета в файл"""
-    await callback_query.answer("Функція експорту буде реалізована в наступній версії!", show_alert=True)
-
-# Обработчики сообщений
+# Обработка сообщений
 @dp.message_handler(content_types=types.ContentType.TEXT)
-async def handle_text_message(message: types.Message):
-    """Обработка текстовых сообщений"""
+async def handle_message(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
+    state = user_states.get(user_id)
     
-    # Если пользователь в состоянии ожидания API ключа
-    if user_id in WAITING_API_KEY:
-        WAITING_API_KEY.discard(user_id)
-        
-        if is_valid_vt_key(text):
-            # Сохраняем ключ в БД
-            async with aiosqlite.connect("vt_domains_bot.db") as db:
+    # Обработка API ключа
+    if state == "waiting_key":
+        if is_valid_key(text):
+            async with aiosqlite.connect("vt_bot.db") as db:
                 await db.execute(
-                    "INSERT OR REPLACE INTO users (user_id, vt_api_key) VALUES (?, ?)",
+                    "INSERT OR REPLACE INTO users (user_id, api_key) VALUES (?, ?)",
                     (user_id, text)
                 )
                 await db.commit()
             
-            await message.answer(
-                "🔐 API-ключ *успішно збережено* для твого акаунта.\n\n"
-                "Тепер можеш користуватися разовою перевіркою доменів.",
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown"
-            )
+            user_states.pop(user_id, None)
+            await message.answer("✅ API ключ збережено", reply_markup=main_menu())
         else:
-            await message.answer(
-                "Схоже, це не дуже схоже на API-ключ VirusTotal 😅\n"
-                "Ключ зазвичай виглядає як 64-символьний hex.\n"
-                "Спробуй ще раз або натисни /cancel, щоб скасувати.",
-                reply_markup=get_back_to_menu_keyboard()
-            )
+            await message.answer("❌ Невірний формат ключа. Спробуйте ще раз:", reply_markup=back_button())
         return
     
-    # Если пользователь в состоянии ожидания доменов для разовой проверки
-    if user_id in WAITING_DOMAINS_ONETIME:
+    # Обработка доменов
+    elif state == "waiting_domains":
         domains = parse_domains(text)
-        
         if not domains:
-            await message.answer(
-                "Не знайшов жодного домена в повідомленні 🤔\n"
-                "Переконайся, що надсилаєш саме домени, а не щось інше.",
-                reply_markup=get_back_to_menu_keyboard()
-            )
+            await message.answer("❌ Не знайдено доменів. Спробуйте ще раз:", reply_markup=back_button())
             return
         
-        WAITING_DOMAINS_ONETIME.discard(user_id)
+        user_states.pop(user_id, None)
         
-        # Получаем API ключ пользователя
-        async with aiosqlite.connect("vt_domains_bot.db") as db:
-            cursor = await db.execute("SELECT vt_api_key FROM users WHERE user_id = ?", (user_id,))
-            user_data = await cursor.fetchone()
+        # Получаем API ключ
+        async with aiosqlite.connect("vt_bot.db") as db:
+            cursor = await db.execute("SELECT api_key FROM users WHERE user_id = ?", (user_id,))
+            row = await cursor.fetchone()
         
-        if not user_data or not user_data[0]:
-            await message.answer(
-                "❌ Не знайдено API-ключ. Будь ласка, спочатку встанови ключ.",
-                reply_markup=get_main_keyboard()
-            )
+        if not row:
+            await message.answer("❌ API ключ не знайдено", reply_markup=main_menu())
             return
         
-        api_key = user_data[0]
-        
-        # Запускаем проверку
-        await run_one_time_check(message, domains, api_key)
+        api_key = row[0]
+        await process_domains_check(message, domains, api_key)
         return
     
-    # Автоматическое распознавание API ключа
-    if is_valid_vt_key(text):
-        # Проверяем нет ли уже ключа у пользователя
-        async with aiosqlite.connect("vt_domains_bot.db") as db:
-            cursor = await db.execute("SELECT vt_api_key FROM users WHERE user_id = ?", (user_id,))
-            user_data = await cursor.fetchone()
+    # Авто-определение API ключа
+    elif is_valid_key(text):
+        async with aiosqlite.connect("vt_bot.db") as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO users (user_id, api_key) VALUES (?, ?)",
+                (user_id, text)
+            )
+            await db.commit()
         
-        if not user_data or not user_data[0]:
-            # Сохраняем ключ
-            async with aiosqlite.connect("vt_domains_bot.db") as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO users (user_id, vt_api_key) VALUES (?, ?)",
-                    (user_id, text)
-                )
-                await db.commit()
-            
-            await message.answer(
-                "🔐 API-ключ *успішно збережено* для твого акаунта.\n\n"
-                "Тепер можеш користуватися разовою перевіркою доменів.",
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown"
-            )
-        else:
-            await message.answer(
-                "✅ API-ключ вже збережений. Можеш перевіряти домени.",
-                reply_markup=get_main_keyboard()
-            )
+        await message.answer("✅ API ключ збережено", reply_markup=main_menu())
         return
     
-    # Непонятный текст
-    await message.answer(
-        "Не зовсім зрозумів, що ти маєш на увазі 🧐\n"
-        "Скористайся кнопками нижче:",
-        reply_markup=get_main_keyboard()
-    )
+    # Неизвестное сообщение
+    await message.answer("Оберіть дію з меню:", reply_markup=main_menu())
 
-# Основная логика проверки доменов
-async def run_one_time_check(message: types.Message, domains: List[str], api_key: str):
-    """Запускает разовую проверку доменов"""
+# Основная логика проверки
+async def process_domains_check(message: types.Message, domains: list, api_key: str):
     total = len(domains)
-    progress_msg = await message.answer(f"🚀 Починаю перевірку {total} доменів через VirusTotal...\nПрогрес: 0/{total}")
+    progress_msg = await message.answer(f"🔍 Перевіряю {total} доменів...\n0/{total}")
     
     results = []
     
     for i, domain in enumerate(domains, 1):
-        # Проверяем домен
-        result = await check_domain_vt(domain, api_key)
+        result = await check_domain(domain, api_key)
         result["domain"] = domain
         results.append(result)
         
         # Обновляем прогресс
-        short_line = build_short_line(result)
+        status = "✅" if "error" not in result and not result.get("problems") else "⚠️" if "error" not in result else "❌"
         try:
             await progress_msg.edit_text(
-                f"🚀 Перевірка доменів...\nПрогрес: *{i}/{total}*\n\nОстанній результат:\n{short_line}",
-                parse_mode="Markdown"
+                f"🔍 Перевіряю {total} доменів...\n{i}/{total}\n\nОстанній: {domain} {status}"
             )
-        except Exception as e:
-            logger.warning(f"Could not update progress message: {e}")
+        except:
+            pass
         
-        # Небольшая задержка чтобы не превысить лимиты VT
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)  # Задержка между запросами
     
-    # Финальный summary
-    stats = calculate_stats(results)
-    summary_text = build_summary_text(stats, total)
+    # Сохраняем отчет
+    user_last_report[message.from_user.id] = results
     
-    await progress_msg.edit_text(summary_text, reply_markup=get_report_keyboard(), parse_mode="Markdown")
-    
-    # Детальный отчет
-    detailed_report = build_detailed_report(results)
-    report_chunks = chunk_text(detailed_report)
-    
-    for chunk in report_chunks:
-        await message.answer(chunk, parse_mode="Markdown")
-
-def build_short_line(result: Dict) -> str:
-    """Строит короткую строку результата для прогресса"""
-    domain = result["domain"]
-    
-    if "error" in result:
-        return f"{domain} — ❌ помилка: {result['error']}"
-    
-    problems = result.get("problems", [])
-    risk_level, risk_text = calculate_risk_level(problems)
-    
-    return f"{domain} — {risk_text}"
-
-def calculate_stats(results: List[Dict]) -> Dict:
-    """Считает статистику по результатам"""
-    stats = {
-        "ok_count": 0,
-        "warn_count": 0, 
-        "bad_count": 0,
-        "error_count": 0
-    }
-    
+    # Показываем итоги
+    stats = {"ok": 0, "warn": 0, "bad": 0, "error": 0}
     for result in results:
         if "error" in result:
-            stats["error_count"] += 1
-            continue
-        
-        problems = result.get("problems", [])
-        risk_level, _ = calculate_risk_level(problems)
-        
-        if risk_level == "green":
-            stats["ok_count"] += 1
-        elif risk_level == "yellow":
-            stats["warn_count"] += 1
-        elif risk_level == "red":
-            stats["bad_count"] += 1
+            stats["error"] += 1
+        else:
+            _, level = get_risk_level(result.get("problems", []))
+            if level == "green": stats["ok"] += 1
+            elif level == "yellow": stats["warn"] += 1
+            else: stats["bad"] += 1
     
-    return stats
+    summary = f"""📊 Результати перевірки
 
-def build_summary_text(stats: Dict, total: int) -> str:
-    """Строит текст сводки"""
-    return f"""*Готово.*
-Усього доменів: *{total}*
-✅ Без проблем: *{stats['ok_count']}*
-⚠️ З 1–2 попередженнями: *{stats['warn_count']}*  
-❌ З великою кількістю детектів: *{stats['bad_count']}*
-🚫 З помилками перевірки: *{stats['error_count']}*"""
+• Усього доменів: {total}
+• 🟢 Безпечних: {stats['ok']}
+• 🟡 Підозрілих: {stats['warn']}  
+• 🔴 Небезпечних: {stats['bad']}
+• ❌ Помилок: {stats['error']}"""
 
-def build_detailed_report(results: List[Dict]) -> str:
-    """Строит детальный отчет"""
-    report_lines = ["*ДЕТАЛЬНИЙ ЗВІТ*\n"]
+    keyboard = InlineKeyboardMarkup()
+    keyboard.row(InlineKeyboardButton("📋 Детальний звіт", callback_data="detailed_report"))
+    keyboard.row(InlineKeyboardButton("📎 Експорт CSV", callback_data="export_csv"))
+    keyboard.row(InlineKeyboardButton("🔙 Головне меню", callback_data="main_menu"))
+    
+    await progress_msg.edit_text(summary, reply_markup=keyboard)
+    
+    # Отправляем детальный отчет частями
+    await send_detailed_report(message, results)
+
+async def send_detailed_report(message: types.Message, results: list):
+    report_parts = []
+    current_part = "📋 Детальний звіт:\n\n"
     
     for result in results:
         domain = result["domain"]
         
         if "error" in result:
-            report_lines.append(f"❌ *{domain}* — помилка: `{result['error']}`\n")
-            continue
-        
-        problems = result.get("problems", [])
-        risk_level, risk_text = calculate_risk_level(problems)
-        
-        report_lines.append(f"*{domain}* — {risk_text}")
-        
-        if not problems:
-            report_lines.append("Статус: *немає проблемних детекторів загроз*.")
+            line = f"❌ {domain}\nПомилка: {result['error']}\n\n"
         else:
-            problem_count = len(problems)
-            if problem_count == 1:
-                status_text = "1 проблемний детектор загроз"
-            elif problem_count <= 4:
-                status_text = f"{problem_count} проблемні детектори загроз"
+            problems = result.get("problems", [])
+            risk_text, level = get_risk_level(problems)
+            
+            line = f"{risk_text} - {domain}\n"
+            
+            if not problems:
+                line += "• Детекторів не знайдено\n"
             else:
-                status_text = f"{problem_count} проблемних детекторів загроз"
+                line += f"• Детекторів: {len(problems)}\n"
+                for problem in problems[:3]:  # Показываем первые 3 детектора
+                    ukr_cat = CATEGORY_TRANSLATIONS.get(problem["category"], problem["category"])
+                    line += f"  - {problem['engine_name']}: {ukr_cat}\n"
             
-            report_lines.append(f"Статус: *{status_text}*.")
-            
-            if problems:
-                report_lines.append("Детектори:")
-                for problem in problems[:10]:  # Ограничиваем количество для читаемости
-                    ukr_category = translate_category(problem["category"])
-                    report_lines.append(f"- {problem['engine_name']} — {problem['category']} ({ukr_category})")
-                
-                if len(problems) > 10:
-                    report_lines.append(f"- ... та ще {len(problems) - 10} детекторів")
+            line += f"• [Перевірити в VT](https://www.virustotal.com/gui/domain/{domain})\n\n"
         
-        # Рекомендация
-        if risk_level == "green":
-            recommendation = "Рекомендація: ризик мінімальний, домен виглядає чистим."
-        elif risk_level == "yellow":
-            recommendation = "Рекомендація: можна тестувати, але обережно. Не лий великий обсяг трафіку та стеж за детектами."
-        else:  # red
-            recommendation = "Рекомендація: не рекомендується лити трафік на цей домен. Краще змінити лендинг або домен. Високий ризик блокувань і скарг."
-        
-        report_lines.append(recommendation)
-        
-        # Ссылка на VT
-        vt_url = f"https://www.virustotal.com/gui/domain/{domain}"
-        report_lines.append(f"🔗 [Перевірка у VirusTotal]({vt_url})\n")
+        # Если часть становится слишком большой, отправляем и начинаем новую
+        if len(current_part + line) > 4000:
+            report_parts.append(current_part)
+            current_part = line
+        else:
+            current_part += line
     
-    return "\n".join(report_lines)
+    if current_part:
+        report_parts.append(current_part)
+    
+    # Отправляем части отчета
+    for part in report_parts:
+        await message.answer(part, parse_mode="Markdown", disable_web_page_preview=True)
+
+# Дополнительные callback-ы
+@dp.callback_query_handler(lambda c: c.data == "detailed_report")
+async def detailed_report_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    results = user_last_report.get(user_id)
+    
+    if not results:
+        await callback.answer("Звіт не знайдено")
+        return
+    
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="main_menu"))
+    
+    await callback.message.answer("📋 Завантажую детальний звіт...")
+    await send_detailed_report(callback.message, results)
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "export_csv")
+async def export_csv_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    results = user_last_report.get(user_id)
+    
+    if not results:
+        await callback.answer("Дані для експорту не знайдено")
+        return
+    
+    # Создаем CSV в памяти
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Домен", "Ризик", "Детектори", "Помилка"])
+    
+    for result in results:
+        domain = result["domain"]
+        
+        if "error" in result:
+            writer.writerow([domain, "", "", result["error"]])
+        else:
+            risk_text, level = get_risk_level(result.get("problems", []))
+            detectors = ", ".join([
+                f"{p['engine_name']}({p['category']})" 
+                for p in result.get("problems", [])
+            ])
+            writer.writerow([domain, risk_text, detectors, ""])
+    
+    # Создаем файл
+    csv_data = output.getvalue().encode('utf-8')
+    file = io.BytesIO(csv_data)
+    file.name = f"vt_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    
+    await callback.message.answer_document(file, caption="📎 Експорт у CSV")
+    await callback.answer()
 
 # Запуск бота
-async def on_startup(dp):
-    """Действия при запуске бота"""
+async def on_startup(_):
     await init_db()
-    logger.info("Бот запущен и готов к работе!")
+    logger.info("Бот запущений!")
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
