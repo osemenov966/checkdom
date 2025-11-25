@@ -26,17 +26,12 @@ if "BOT_TOKEN" not in os.environ:
     raise RuntimeError("Не задано BOT_TOKEN. Додай змінну оточення BOT_TOKEN на хостингу з токеном свого Telegram-бота.")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+ADMIN_ID = os.environ.get("ADMIN_ID")
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-
-# Состояния пользователя
-class UserState(StatesGroup):
-    waiting_api_key = State()
-    waiting_domains_onetime = State()
 
 # In-memory состояния
 WAITING_API_KEY: Set[int] = set()
@@ -181,6 +176,18 @@ async def check_domain_vt(domain: str, api_key: str) -> Dict:
     
     try:
         response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code == 404:
+            return {"error": "http_404"}
+        elif response.status_code == 401:
+            return {"error": "http_401_unauthorized"}
+        elif response.status_code == 429:
+            return {"error": "http_429_rate_limit"}
+        elif response.status_code >= 500:
+            return {"error": f"http_{response.status_code}_server_error"}
+        elif response.status_code != 200:
+            return {"error": f"http_{response.status_code}"}
+        
         response.raise_for_status()
         
         data = response.json()
@@ -221,10 +228,17 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
     )
     return keyboard
 
+def get_back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с кнопкой назад в меню"""
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад до меню", callback_data="back_to_menu"))
+    return keyboard
+
 def get_report_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура для экспорта отчета"""
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("📎 Отримати звіт файлом", callback_data="export_report"))
+    keyboard.add(InlineKeyboardButton("🔙 Назад до меню", callback_data="back_to_menu"))
     return keyboard
 
 # Обработчики команд
@@ -240,7 +254,7 @@ async def cmd_start(message: types.Message):
     
     has_api_key = user_data and user_data[0]
     
-    welcome_text = f"""ЙОВ! 👋
+    welcome_text = """ЙОВ! 👋
 
 Це бот для перевірки доменів через VirusTotal.
 
@@ -259,28 +273,49 @@ async def cmd_start(message: types.Message):
 📅 Щоденна перевірка списків (щодня о 11:00 за Києвом).
 """
     
-    await message.answer(welcome_text, reply_markup=get_main_keyboard())
+    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @dp.message_handler(commands=['cancel'])
 async def cmd_cancel(message: types.Message):
     """Обработчик команды /cancel"""
     # Сбрасываем состояния
-    WAITING_API_KEY.discard(message.from_user.id)
-    WAITING_DOMAINS_ONETIME.discard(message.from_user.id)
+    user_id = message.from_user.id
+    WAITING_API_KEY.discard(user_id)
+    WAITING_DOMAINS_ONETIME.discard(user_id)
     
     await message.answer("✅ Поточну дію скасовано. Повертаюся до головного меню.", 
                         reply_markup=get_main_keyboard())
 
 # Обработчики callback-ов
-@dp.callback_query_handler(lambda c: c.data == "back_to_menu")
+@dp.callback_query_handler(text="back_to_menu")
 async def callback_back_to_menu(callback_query: types.CallbackQuery):
     """Возврат в главное меню"""
-    await callback_query.message.edit_text(
-        "Повертаюся до головного меню:",
-        reply_markup=get_main_keyboard()
-    )
+    user_id = callback_query.from_user.id
+    WAITING_API_KEY.discard(user_id)
+    WAITING_DOMAINS_ONETIME.discard(user_id)
+    
+    # Проверяем есть ли API ключ пользователя
+    async with aiosqlite.connect("vt_domains_bot.db") as db:
+        cursor = await db.execute("SELECT vt_api_key FROM users WHERE user_id = ?", (user_id,))
+        user_data = await cursor.fetchone()
+    
+    has_api_key = user_data and user_data[0]
+    
+    welcome_text = """Повертаюся до головного меню:
 
-@dp.callback_query_handler(lambda c: c.data == "set_api_key")
+"""
+    
+    if has_api_key:
+        welcome_text += "✅ API-ключ уже збережений. Можеш одразу перевіряти домени.\n\n"
+    else:
+        welcome_text += "❗ Зараз API-ключ ще *не збережений*.\n\n"
+    
+    welcome_text += "Обери режим роботи:"
+    
+    await callback_query.message.edit_text(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    await callback_query.answer()
+
+@dp.callback_query_handler(text="set_api_key")
 async def callback_set_api_key(callback_query: types.CallbackQuery):
     """Настройка API ключа"""
     user_id = callback_query.from_user.id
@@ -293,10 +328,10 @@ async def callback_set_api_key(callback_query: types.CallbackQuery):
 
 _Приклад_: `495ae894e66dcd4b...`"""
     
-    await callback_query.message.edit_text(text)
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_to_menu_keyboard())
     await callback_query.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "one_time_check")
+@dp.callback_query_handler(text="one_time_check")
 async def callback_one_time_check(callback_query: types.CallbackQuery):
     """Разовая проверка доменов"""
     user_id = callback_query.from_user.id
@@ -311,7 +346,7 @@ async def callback_one_time_check(callback_query: types.CallbackQuery):
 
 Натисни *«🔐 Мій API-ключ»* у меню нижче або просто надішли свій ключ
 одним повідомленням — я його розпізнаю і збережу."""
-        await callback_query.message.edit_text(text, reply_markup=get_main_keyboard())
+        await callback_query.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
         return
     
     WAITING_DOMAINS_ONETIME.add(user_id)
@@ -329,15 +364,15 @@ _Приклад:_
 `fitnesalasinia.com`
 `www.healthblog.life`"""
     
-    await callback_query.message.edit_text(text)
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_to_menu_keyboard())
     await callback_query.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "daily_coming_soon")
+@dp.callback_query_handler(text="daily_coming_soon")
 async def callback_daily_coming_soon(callback_query: types.CallbackQuery):
     """Заглушка для ежедневных проверок"""
     await callback_query.answer("📅 Функція щоденної перевірки списків буде доступна найближчим часом!", show_alert=True)
 
-@dp.callback_query_handler(lambda c: c.data == "help_limits")
+@dp.callback_query_handler(text="help_limits")
 async def callback_help_limits(callback_query: types.CallbackQuery):
     """Помощь и лимиты"""
     text = """ℹ️ *Допомога та ліміти*
@@ -358,16 +393,12 @@ async def callback_help_limits(callback_query: types.CallbackQuery):
 - 🟡 Середній ризик — кілька легких підозр (suspicious)
 - 🔴 Високий ризик — фішинг/малваре, багато детектів"""
     
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🔙 Назад до меню", callback_data="back_to_menu"))
-    
-    await callback_query.message.edit_text(text, reply_markup=keyboard)
+    await callback_query.message.edit_text(text, reply_markup=get_back_to_menu_keyboard(), parse_mode="Markdown")
     await callback_query.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "export_report")
+@dp.callback_query_handler(text="export_report")
 async def callback_export_report(callback_query: types.CallbackQuery):
     """Экспорт отчета в файл"""
-    # В реальной реализации здесь будет логика экспорта последнего отчета
     await callback_query.answer("Функція експорту буде реалізована в наступній версії!", show_alert=True)
 
 # Обработчики сообщений
@@ -393,13 +424,15 @@ async def handle_text_message(message: types.Message):
             await message.answer(
                 "🔐 API-ключ *успішно збережено* для твого акаунта.\n\n"
                 "Тепер можеш користуватися разовою перевіркою доменів.",
-                reply_markup=get_main_keyboard()
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
             )
         else:
             await message.answer(
                 "Схоже, це не дуже схоже на API-ключ VirusTotal 😅\n"
                 "Ключ зазвичай виглядає як 64-символьний hex.\n"
-                "Спробуй ще раз або натисни /cancel, щоб скасувати."
+                "Спробуй ще раз або натисни /cancel, щоб скасувати.",
+                reply_markup=get_back_to_menu_keyboard()
             )
         return
     
@@ -410,7 +443,8 @@ async def handle_text_message(message: types.Message):
         if not domains:
             await message.answer(
                 "Не знайшов жодного домена в повідомленні 🤔\n"
-                "Переконайся, що надсилаєш саме домени, а не щось інше."
+                "Переконайся, що надсилаєш саме домени, а не щось інше.",
+                reply_markup=get_back_to_menu_keyboard()
             )
             return
         
@@ -453,7 +487,8 @@ async def handle_text_message(message: types.Message):
             await message.answer(
                 "🔐 API-ключ *успішно збережено* для твого акаунта.\n\n"
                 "Тепер можеш користуватися разовою перевіркою доменів.",
-                reply_markup=get_main_keyboard()
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
             )
         else:
             await message.answer(
@@ -487,7 +522,8 @@ async def run_one_time_check(message: types.Message, domains: List[str], api_key
         short_line = build_short_line(result)
         try:
             await progress_msg.edit_text(
-                f"🚀 Перевірка доменів...\nПрогрес: *{i}/{total}*\n\nОстанній результат:\n{short_line}"
+                f"🚀 Перевірка доменів...\nПрогрес: *{i}/{total}*\n\nОстанній результат:\n{short_line}",
+                parse_mode="Markdown"
             )
         except Exception as e:
             logger.warning(f"Could not update progress message: {e}")
@@ -499,14 +535,14 @@ async def run_one_time_check(message: types.Message, domains: List[str], api_key
     stats = calculate_stats(results)
     summary_text = build_summary_text(stats, total)
     
-    await progress_msg.edit_text(summary_text, reply_markup=get_report_keyboard())
+    await progress_msg.edit_text(summary_text, reply_markup=get_report_keyboard(), parse_mode="Markdown")
     
     # Детальный отчет
     detailed_report = build_detailed_report(results)
     report_chunks = chunk_text(detailed_report)
     
     for chunk in report_chunks:
-        await message.answer(chunk)
+        await message.answer(chunk, parse_mode="Markdown")
 
 def build_short_line(result: Dict) -> str:
     """Строит короткую строку результата для прогресса"""
@@ -575,7 +611,6 @@ def build_detailed_report(results: List[Dict]) -> str:
             report_lines.append("Статус: *немає проблемних детекторів загроз*.")
         else:
             problem_count = len(problems)
-            status_text = "немає проблемних детекторів загроз"
             if problem_count == 1:
                 status_text = "1 проблемний детектор загроз"
             elif problem_count <= 4:
